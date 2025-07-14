@@ -360,7 +360,7 @@ def process_files(s3_client, lambda_client, bucket_name, input_template_file, so
     try:
         # ステップ1: ファイルをS3にアップロード
         status_text.text("📤 ファイルをS3にアップロード中...")
-        progress_bar.progress(10)
+        progress_bar.progress(0.1)
         
         # テンプレートファイルをアップロード
         template_key = f"templates/{process_id}_input.xlsx"
@@ -376,12 +376,14 @@ def process_files(s3_client, lambda_client, bucket_name, input_template_file, so
             source_file.seek(0)
             if upload_file_to_s3(source_file, s3_client, source_key, bucket_name):
                 source_keys.append(source_key)
-                progress_bar.progress(10 + (i + 1) * 25 / len(source_files))
+                # プログレスバーの値を0.0-1.0の範囲内に正規化
+                progress_value = 0.1 + (i + 1) * 0.25 / len(source_files)
+                progress_bar.progress(min(progress_value, 1.0))
             else:
                 st.error(f"❌ {source_file.name} のアップロードに失敗しました")
                 return
         
-        progress_bar.progress(100)
+        progress_bar.progress(1.0)
         status_text.text("✅ ファイルアップロード完了")
         
         st.success(f"🎉 {len(source_files) + 1} ファイルのアップロードが完了しました")
