@@ -1,0 +1,6 @@
+# Streamlit AWS Lambda連携アプリケーション用の追加requirements
+streamlit>=1.28.0
+boto3>=1.26.0
+pandas>=1.5.0
+uuid
+zipfile36  # Python 3.6以降のzipfile互換
