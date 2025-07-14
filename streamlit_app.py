@@ -6,7 +6,11 @@ AWS Lambda連携（S3バケット自動作成対応）
 """
 
 import streamlit as st
-import pandas as pd
+try:
+    import pandas as pd
+except ImportError as e:
+    st.error(f"pandasインポートエラー: {e}")
+    st.stop()
 import boto3
 import json
 import tempfile
@@ -211,6 +215,7 @@ def setup_sidebar():
     """サイドバーの設定"""
     st.sidebar.header("📋 システム情報")
     
+    # バージョン情報
     st.sidebar.markdown("""
     ### 🎯 Excel集計システム
     - **バージョン**: 1.1.0
@@ -218,6 +223,25 @@ def setup_sidebar():
     - **環境**: Streamlit Cloud + AWS Lambda
     - **データ抽出**: Smart AI風アルゴリズム
     """)
+    
+    # デバッグ情報
+    st.sidebar.markdown("""
+    ### 🔍 デバッグ情報
+    """)
+    
+    # Pythonバージョン情報
+    import sys
+    st.sidebar.write(f"Python: {sys.version.split()[0]}")
+    
+    # pandasバージョン情報
+    try:
+        import pandas as pd
+        st.sidebar.write(f"Pandas: {pd.__version__}")
+    except ImportError as e:
+        st.sidebar.error(f"Pandas: エラー ({str(e)[:30]}...)")
+    
+    # streamlitバージョン情報
+    st.sidebar.write(f"Streamlit: {st.__version__}")
     
     st.sidebar.markdown("""
     ### 📊 対応項目
@@ -453,7 +477,13 @@ def process_files(s3_client, lambda_client, bucket_name, input_template_file, so
         status_text.text("📊 結果を処理中...")
         
         if lambda_result.get('statusCode') == 200:
-            import pandas as pd
+            # pandasをここでインポート（遅延インポート）
+            try:
+                import pandas as pd
+            except ImportError:
+                st.error("❌ pandasが利用できません。結果表示が制限されます。")
+                pd = None
+            
             body = json.loads(lambda_result['body']) if isinstance(lambda_result.get('body'), str) else lambda_result.get('body', {})
             results = body.get('results', [])
             processed_files = body.get('processed_files', [])
@@ -470,8 +500,15 @@ def process_files(s3_client, lambda_client, bucket_name, input_template_file, so
             
             # 結果テーブル
             if results:
-                results_df = pd.DataFrame(results)
-                st.dataframe(results_df, use_container_width=True)
+                if pd is not None:
+                    try:
+                        results_df = pd.DataFrame(results)
+                        st.dataframe(results_df, use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"テーブル表示エラー: {e}")
+                        st.json(results)  # フォールバックとしてJSON表示
+                else:
+                    st.json(results)  # pandasがない場合はJSON表示
                 
                 # 成功/失敗の統計
                 success_count = len([r for r in results if r.get('status') == 'success'])
