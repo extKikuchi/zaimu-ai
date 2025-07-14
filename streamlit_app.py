@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Streamlit Cloud対応版 Excel データ集計システム
-AWS Lambda連携（smart_aggregator依存なし）
+AWS Lambda連携（Pandas非依存版）
 """
 
 import streamlit as st
-import pandas as pd
 import boto3
 import json
 import tempfile
@@ -159,6 +158,46 @@ def show_system_stats(s3_client):
     except Exception as e:
         st.warning(f"⚠️ 統計取得エラー: {e}")
 
+def display_results_table(results):
+    """結果をテーブル形式で表示（Pandas非依存）"""
+    if not results:
+        return
+    
+    # テーブルヘッダー
+    st.markdown("### 📊 処理結果詳細")
+    
+    # HTMLテーブルを作成
+    table_html = """
+    <table style="width:100%; border-collapse: collapse;">
+    <thead>
+        <tr style="background-color: #f0f2f6;">
+            <th style="border: 1px solid #ddd; padding: 8px;">ファイル名</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">ステータス</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">抽出項目数</th>
+            <th style="border: 1px solid #ddd; padding: 8px;">出力ファイル</th>
+        </tr>
+    </thead>
+    <tbody>
+    """
+    
+    for result in results:
+        status_icon = "✅" if result['status'] == 'success' else "❌"
+        table_html += f"""
+        <tr>
+            <td style="border: 1px solid #ddd; padding: 8px;">{result.get('source_file', 'N/A')}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{status_icon} {result.get('status', 'N/A')}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{result.get('extracted_items', 0)}</td>
+            <td style="border: 1px solid #ddd; padding: 8px;">{result.get('output_file', 'N/A')}</td>
+        </tr>
+        """
+    
+    table_html += """
+    </tbody>
+    </table>
+    """
+    
+    st.markdown(table_html, unsafe_allow_html=True)
+
 def download_files(s3_client, processed_files, zip_results):
     """ファイルダウンロード処理"""
     
@@ -300,10 +339,9 @@ def process_files(s3_client, lambda_client, input_template_file, source_files,
             # 結果表示
             st.header("📋 処理結果")
             
-            # 結果テーブル
+            # 結果テーブル（Pandas非依存）
             if results:
-                results_df = pd.DataFrame(results)
-                st.dataframe(results_df, use_container_width=True)
+                display_results_table(results)
                 
                 # 成功/失敗の統計
                 success_count = len([r for r in results if r['status'] == 'success'])
