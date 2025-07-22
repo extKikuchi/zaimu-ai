@@ -1,647 +1,555 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Streamlit Cloud対応版 Excel データ集計システム
-AWS Lambda連携（S3バケット自動作成対応）
-"""
-
 import streamlit as st
-try:
-    import pandas as pd
-except ImportError as e:
-    st.error(f"pandasインポートエラー: {e}")
-    st.stop()
 import boto3
 import json
-import tempfile
-import zipfile
-from pathlib import Path
-import io
-import time
+import pandas as pd
 from datetime import datetime
-import uuid
+import tempfile
 import os
+from pathlib import Path
 
-# ページ設定
+# Streamlit設定
 st.set_page_config(
-    page_title="📊 Excel データ集計システム",
+    page_title="AI Excel集計システム (Claude API版)",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# AWS設定
-@st.cache_data
-def get_aws_config():
-    """AWS設定を取得"""
-    
-    # 既存のexcel_aggregatorプロジェクトからaws_config.jsonを読み込み
-    try:
-        import os
-        # 親ディレクトリのexcel_aggregatorフォルダを探してaws_config.jsonを取得
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        excel_aggregator_path = os.path.join(os.path.dirname(os.path.dirname(current_dir)), 'excel_aggregator')
-        config_path = os.path.join(excel_aggregator_path, 'aws_config.json')
-        
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                local_config = json.load(f)
-            
-            config = {
-                'region': local_config.get('Region', st.secrets.get('AWS_DEFAULT_REGION', 'ap-northeast-1')),
-                'lambda_function_name': local_config.get('FunctionName', st.secrets.get('LAMBDA_FUNCTION_NAME', 'excel-data-aggregator')),
-                'bucket_name': local_config.get('BucketName', st.secrets.get('S3_BUCKET_NAME', 'excel-aggregator-20250714-095126'))
-            }
-            st.sidebar.success(f"✅ aws_config.jsonを読み込みました")
-            st.sidebar.write(f"  • バケット: {config['bucket_name']}")
-            st.sidebar.write(f"  • Lambda: {config['lambda_function_name']}")
-            return config
-    except Exception as e:
-        st.sidebar.warning(f"aws_config.json読み込みエラー: {e}")
-    
-    # フォールバック: Streamlit Secretsから読み込み
-    default_bucket = st.secrets.get('S3_BUCKET_NAME', 'excel-aggregator-backup-20250714')
-    
-    config = {
-        'region': st.secrets.get('AWS_DEFAULT_REGION', 'ap-northeast-1'),
-        'lambda_function_name': st.secrets.get('LAMBDA_FUNCTION_NAME', 'excel-data-aggregator'),
-        'bucket_name': default_bucket
-    }
-    
-    return config
+# セッション状態の初期化
+def init_session_state():
+    """セッション状態を初期化"""
+    if 'file_configs' not in st.session_state:
+        st.session_state.file_configs = []
+    if 'processing' not in st.session_state:
+        st.session_state.processing = False
 
-def get_or_create_bucket(s3_client):
-    """S3バケットを取得または作成"""
-    aws_config = get_aws_config()
-    bucket_name = aws_config['bucket_name']
-    
-    try:
-        # 既存バケットの確認
-        s3_client.head_bucket(Bucket=bucket_name)
-        st.success(f"✅ 既存のS3バケットを使用: {bucket_name}")
-        return bucket_name
-    except Exception as e:
-        if "403" in str(e) or "Forbidden" in str(e):
-            st.warning(f"⚠️ バケット {bucket_name} へのアクセス権限がありません")
-            
-            # 利用可能なバケットを確認
-            try:
-                response = s3_client.list_buckets()
-                available_buckets = [bucket['Name'] for bucket in response['Buckets']]
-                
-                if available_buckets:
-                    st.info("📋 利用可能なS3バケット:")
-                    for bucket in available_buckets[:5]:  # 最初の5個を表示
-                        st.write(f"   • {bucket}")
-                    
-                    # 最初の利用可能なバケットを使用
-                    selected_bucket = available_buckets[0]
-                    st.success(f"✅ 利用可能なバケットを使用: {selected_bucket}")
-                    return selected_bucket
-                else:
-                    # 新しいバケットを作成
-                    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-                    new_bucket_name = f"excel-aggregator-{timestamp}"
-                    
-                    try:
-                        if aws_config['region'] == 'us-east-1':
-                            s3_client.create_bucket(Bucket=new_bucket_name)
-                        else:
-                            s3_client.create_bucket(
-                                Bucket=new_bucket_name,
-                                CreateBucketConfiguration={'LocationConstraint': aws_config['region']}
-                            )
-                        
-                        st.success(f"✅ 新しいS3バケットを作成: {new_bucket_name}")
-                        return new_bucket_name
-                    except Exception as create_error:
-                        st.error(f"❌ バケット作成エラー: {create_error}")
-                        return None
-            except Exception as list_error:
-                st.error(f"❌ バケット一覧取得エラー: {list_error}")
-                return None
-        else:
-            st.error(f"❌ バケット確認エラー: {e}")
-            return None
-
+# AWSクライアント設定
 @st.cache_resource
-def init_aws_clients():
-    """AWS クライアントの初期化"""
+def get_aws_clients():
+    """AWSクライアントを取得"""
     try:
-        aws_config = get_aws_config()
+        # Streamlit CloudのSecretsから認証情報を取得
+        aws_access_key_id = st.secrets["AWS_ACCESS_KEY_ID"]
+        aws_secret_access_key = st.secrets["AWS_SECRET_ACCESS_KEY"]
         
-        # Streamlit Cloudのシークレットから認証情報を取得
-        aws_access_key_id = st.secrets.get('AWS_ACCESS_KEY_ID')
-        aws_secret_access_key = st.secrets.get('AWS_SECRET_ACCESS_KEY')
-        
-        # デバッグ情報を表示
-        st.sidebar.write("🔍 認証情報デバッグ:")
-        st.sidebar.write(f"Access Key: {aws_access_key_id[:10]}..." if aws_access_key_id else "Access Key: 未設定")
-        st.sidebar.write(f"Secret Key: {'***設定済み***' if aws_secret_access_key else '未設定'}")
-        st.sidebar.write(f"Region: {aws_config['region']}")
-        
-        if aws_access_key_id and aws_secret_access_key:
-            session = boto3.Session(
-                aws_access_key_id=aws_access_key_id,
-                aws_secret_access_key=aws_secret_access_key,
-                region_name=aws_config['region']
-            )
-        else:
-            session = boto3.Session(region_name=aws_config['region'])
-        
-        s3_client = session.client('s3')
-        lambda_client = session.client('lambda')
-        
-        # 認証情報のテスト
-        try:
-            caller_identity = session.client('sts').get_caller_identity()
-            st.sidebar.write(f"👤 AWSユーザー: {caller_identity.get('Arn', 'Unknown')}")
-        except Exception as auth_error:
-            st.sidebar.error(f"認証エラー: {auth_error}")
-            return None, None, False, f"認証エラー: {auth_error}"
-        
-        # S3バケットの確認・作成
-        bucket_name = get_or_create_bucket(s3_client)
-        if not bucket_name:
-            return None, None, False, "S3バケットの設定に失敗しました"
-        
-        # Lambda関数の確認
-        try:
-            lambda_client.get_function(FunctionName=aws_config['lambda_function_name'])
-        except Exception as lambda_error:
-            st.sidebar.warning(f"Lambda関数エラー: {lambda_error}")
-            return s3_client, lambda_client, True, bucket_name  # S3は成功しているので続行
-        
-        return s3_client, lambda_client, True, bucket_name
-        
-    except Exception as e:
-        st.sidebar.error(f"初期化エラー: {e}")
-        return None, None, False, str(e)
-
-def upload_file_to_s3(file_obj, s3_client, key, bucket_name):
-    """ファイルをS3にアップロード"""
-    try:
-        s3_client.upload_fileobj(file_obj, bucket_name, key)
-        return True
-    except Exception as e:
-        st.error(f"S3アップロードエラー: {e}")
-        return False
-
-def invoke_lambda_function(lambda_client, payload):
-    """Lambda関数を実行"""
-    try:
-        aws_config = get_aws_config()
-        response = lambda_client.invoke(
-            FunctionName=aws_config['lambda_function_name'],
-            Payload=json.dumps(payload)
+        lambda_client = boto3.client(
+            'lambda',
+            region_name='ap-northeast-1',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key
         )
-        
-        result = json.loads(response['Payload'].read().decode())
-        return result
+        s3_client = boto3.client(
+            's3',
+            region_name='ap-northeast-1',
+            aws_access_key_id=aws_access_key_id,
+            aws_secret_access_key=aws_secret_access_key
+        )
+        return lambda_client, s3_client
     except Exception as e:
-        st.error(f"Lambda実行エラー: {e}")
+        st.error(f"AWS接続エラー: {e}")
+        st.error("Streamlit Cloudのsecretsにaws_access_key_idとaws_secret_access_keyが設定されているか確認してください。")
+        return None, None
+
+# 設定値
+BUCKET_NAME = "excel-ai-aggregator-6142"
+REGION = "ap-northeast-1"
+
+# Lambda関数の選択肢
+LAMBDA_FUNCTIONS = {
+    "Claude API版 (推奨)": "excel-claude-aggregator",
+    "従来版": "excel-data-aggregator"
+}
+
+def get_excel_sheets(file_content):
+    """Excelファイルからシート名のリストを取得"""
+    try:
+        import tempfile
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.xlsx') as tmp:
+            tmp.write(file_content)
+            tmp.flush()
+            all_sheets = pd.read_excel(tmp.name, sheet_name=None, nrows=0)
+            os.unlink(tmp.name)
+            return list(all_sheets.keys())
+    except Exception as e:
+        st.warning(f"シート名を自動取得できませんでした。")
         return None
-
-def download_file_from_s3(s3_client, key, bucket_name):
-    """S3からファイルをダウンロード"""
-    try:
-        response = s3_client.get_object(Bucket=bucket_name, Key=key)
-        return response['Body'].read()
-    except Exception as e:
-        st.error(f"S3ダウンロードエラー: {e}")
-        return None
-
-def setup_sidebar():
-    """サイドバーの設定"""
-    st.sidebar.header("📋 システム情報")
-    
-    # バージョン情報
-    st.sidebar.markdown("""
-    ### 🎯 Excel集計システム
-    - **バージョン**: 1.1.0
-    - **最終更新**: 2025-07-14
-    - **環境**: Streamlit Cloud + AWS Lambda
-    - **データ抽出**: Smart AI風アルゴリズム
-    """)
-    
-    # デバッグ情報
-    st.sidebar.markdown("""
-    ### 🔍 デバッグ情報
-    """)
-    
-    # Pythonバージョン情報
-    import sys
-    st.sidebar.write(f"Python: {sys.version.split()[0]}")
-    
-    # pandasバージョン情報
-    try:
-        import pandas as pd
-        st.sidebar.write(f"Pandas: {pd.__version__}")
-    except ImportError as e:
-        st.sidebar.error(f"Pandas: エラー ({str(e)[:30]}...)")
-    
-    # streamlitバージョン情報
-    st.sidebar.write(f"Streamlit: {st.__version__}")
-    
-    st.sidebar.markdown("""
-    ### 📊 対応項目
-    - 売上高、売上原価、売上総利益
-    - 営業利益、経常利益、当期純利益
-    - EBITDA、EBIT
-    """)
-
-def show_system_stats(s3_client, bucket_name):
-    """システム統計の表示"""
-    try:
-        # S3バケットの内容を確認
-        response = s3_client.list_objects_v2(Bucket=bucket_name)
-        
-        if 'Contents' in response:
-            total_files = len(response['Contents'])
-            total_size = sum(obj['Size'] for obj in response['Contents'])
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("📁 総ファイル数", total_files)
-            with col2:
-                st.metric("💾 総サイズ", f"{total_size / 1024 / 1024:.1f} MB")
-            
-            # 最近の処理状況
-            output_files = [obj for obj in response['Contents'] if obj['Key'].startswith('outputs/')]
-            if output_files:
-                latest_file = max(output_files, key=lambda x: x['LastModified'])
-                st.metric("📅 最新処理", latest_file['LastModified'].strftime('%m/%d %H:%M'))
-        else:
-            st.info("📭 処理履歴なし")
-    except Exception as e:
-        st.warning(f"⚠️ 統計取得エラー: {e}")
 
 def main():
     """メイン関数"""
+    init_session_state()
     
-    # ヘッダー
-    st.title("📊 Excel データ集計システム")
-    st.markdown("### 🚀 AWS Lambda連携 事業計画データ自動抽出システム")
+    st.title("📊 AI Excel集計システム (Claude API版)")
     st.markdown("---")
     
-    # サイドバー情報
-    setup_sidebar()
+    # サイドバー
+    st.sidebar.header("⚙️ システム設定")
     
-    # AWS接続状態の確認
-    with st.spinner("🔍 AWS接続を確認中..."):
-        s3_client, lambda_client, aws_connected, result = init_aws_clients()
-    
-    if not aws_connected:
-        st.error("❌ AWS接続に失敗しました")
-        st.code(f"エラー詳細: {result}")
-        show_aws_setup_guide()
+    # AWS接続確認
+    lambda_client, s3_client = get_aws_clients()
+    if not lambda_client or not s3_client:
+        st.error("AWS接続に失敗しました。認証情報を確認してください。")
+        with st.expander("🔧 設定方法"):
+            st.markdown("""
+            ### Streamlit Cloudでの設定方法
+            
+            1. Streamlit Cloudのダッシュボードでアプリを選択
+            2. 右上の歯車アイコン → Settings をクリック
+            3. Secrets タブを選択
+            4. 以下の形式でAWS認証情報を追加:
+            
+            ```toml
+            AWS_ACCESS_KEY_ID = "your_access_key_here"
+            AWS_SECRET_ACCESS_KEY = "your_secret_key_here"
+            ```
+            
+            5. Save をクリック
+            6. アプリを再起動
+            """)
         return
     
-    # 接続成功時はresultはbucket_name
-    bucket_name = result
-    st.success("✅ AWS接続成功")
-    st.info(f"🪣 使用中のS3バケット: {bucket_name}")
-    
-    # メインコンテンツ
-    col1, col2 = st.columns([3, 1])
-    
-    with col1:
-        st.header("📁 ファイルアップロード")
-        
-        # input用テンプレートファイル
-        st.subheader("🎯 input用テンプレートファイル")
-        input_template_file = st.file_uploader(
-            "input用.xlsxファイルをアップロードしてください",
-            type=['xlsx'],
-            key="input_template",
-            help="集計結果を入力するためのテンプレートファイル"
+    # Lambda関数選択
+    try:
+        selected_lambda = st.sidebar.selectbox(
+            "使用するLambda関数",
+            options=list(LAMBDA_FUNCTIONS.keys()),
+            index=0,
+            help="Claude API版は精度が高く推奨です"
         )
         
-        if input_template_file:
-            st.success(f"✅ {input_template_file.name} が選択されました")
-        
-        # 事業計画ファイル
-        st.subheader("📈 事業計画ファイル")
-        source_files = st.file_uploader(
-            "事業計画Excelファイルをアップロードしてください（複数可）",
-            type=['xlsx', 'xls'],
-            accept_multiple_files=True,
-            key="source_files",
-            help="データを抽出する元のExcelファイル"
-        )
-        
-        if source_files:
-            st.success(f"✅ {len(source_files)} ファイルが選択されました")
-            for i, file in enumerate(source_files):
-                st.write(f"  {i+1}. 📄 {file.name}")
-        
-        # 処理オプション
-        st.subheader("⚙️ 処理オプション")
-        col3, col4 = st.columns(2)
-        
-        with col3:
-            show_progress = st.checkbox("処理状況を表示", value=True)
-            zip_results = st.checkbox("結果をZIPで圧縮", value=len(source_files) > 1 if source_files else False)
-        
-        with col4:
-            auto_download = st.checkbox("自動ダウンロード", value=True)
-            keep_files = st.checkbox("S3にファイルを保持", value=False)
-    
-    with col2:
-        st.header("📊 システム状態")
-        
-        # AWS設定情報
-        aws_config = get_aws_config()
-        st.info(f"⚡ **Lambda関数**\n{aws_config['lambda_function_name']}")
-        st.info(f"🌍 **リージョン**\n{aws_config['region']}")
+        lambda_function_name = LAMBDA_FUNCTIONS[selected_lambda]
         
         # Lambda関数の状態確認
         try:
-            lambda_client.get_function(FunctionName=aws_config['lambda_function_name'])
-            st.success("✅ Lambda関数確認済み")
+            lambda_client.get_function(FunctionName=lambda_function_name)
+            st.sidebar.success(f"✅ {selected_lambda} 利用可能")
         except Exception as e:
-            st.error(f"❌ Lambda関数エラー: {str(e)[:50]}...")
-        
-        # システム統計
-        show_system_stats(s3_client, bucket_name)
-        
-        # ヘルプ
-        with st.expander("💡 使用方法"):
-            st.markdown("""
-            **基本的な使用方法:**
-            1. input用テンプレートファイルをアップロード
-            2. 事業計画ファイルをアップロード
-            3. "データ集計実行"をクリック
-            4. 処理結果をダウンロード
-            
-            **対応ファイル:**
-            - Excel (.xlsx, .xls)
-            - 最大50MB
-            
-            **抽出される項目:**
-            - 売上高、売上原価、営業利益
-            - 経常利益、当期純利益、EBITDA など
-            
-            **AI風スマート抽出:**
-            - パターンマッチングで柔軟な項目検出
-            - 隣接セルから数値を自動取得
-            - 複数シート対応
-            """)
-    
-    # 処理実行ボタン
-    st.markdown("---")
-    if st.button("🚀 データ集計実行", type="primary", use_container_width=True):
-        if not input_template_file:
-            st.error("❌ input用テンプレートファイルをアップロードしてください")
-        elif not source_files:
-            st.error("❌ 事業計画ファイルを少なくとも1つアップロードしてください")
-        else:
-            process_files(
-                s3_client,
-                lambda_client,
-                bucket_name,
-                input_template_file,
-                source_files,
-                show_progress,
-                auto_download,
-                zip_results,
-                keep_files
-            )
-
-def process_files(s3_client, lambda_client, bucket_name, input_template_file, source_files, 
-                 show_progress, auto_download, zip_results, keep_files):
-    """ファイル処理のメイン関数"""
-    
-    # 処理ID生成
-    process_id = str(uuid.uuid4())[:8]
-    
-    # プログレスバーとステータス
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    try:
-        # ステップ1: ファイルをS3にアップロード
-        status_text.text("📤 ファイルをS3にアップロード中...")
-        progress_bar.progress(0.1)
-        
-        # テンプレートファイルをアップロード
-        template_key = f"templates/{process_id}_input.xlsx"
-        input_template_file.seek(0)
-        if not upload_file_to_s3(input_template_file, s3_client, template_key, bucket_name):
-            st.error("❌ テンプレートファイルのアップロードに失敗しました")
+            st.sidebar.error(f"❌ {selected_lambda} が見つかりません")
+            st.error(f"Lambda関数 '{lambda_function_name}' が見つかりません。先にデプロイを実行してください。")
+            st.error(f"エラー詳細: {str(e)}")
             return
+    except Exception as e:
+        st.error(f"Lambda関数選択エラー: {e}")
+        return
+    
+    # 会社名入力
+    company_name = st.sidebar.text_input("会社名", value="株式会社テスト企業")
+    
+    st.sidebar.markdown("---")
+    
+    # ファイルアップロード
+    st.sidebar.subheader("📁 ファイルアップロード")
+    uploaded_files = st.sidebar.file_uploader(
+        "集計対象のExcelファイルを選択",
+        type=['xlsx', 'xls'],
+        accept_multiple_files=True,
+        key="file_uploader"
+    )
+    
+    # メインエリア
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.subheader("📋 処理設定")
         
-        # ソースファイルをアップロード
-        source_keys = []
-        for i, source_file in enumerate(source_files):
-            source_key = f"source-files/{process_id}_{i}_{source_file.name}"
-            source_file.seek(0)
-            if upload_file_to_s3(source_file, s3_client, source_key, bucket_name):
-                source_keys.append({"file_key": source_key})
-                # プログレスバーの値を0.0-1.0の範囲内に正規化
-                progress_value = 0.1 + (i + 1) * 0.25 / len(source_files)
-                progress_bar.progress(min(progress_value, 1.0))
+        if uploaded_files:
+            st.success(f"✅ {len(uploaded_files)}個のファイルが選択されました")
+            
+            # ファイル別設定
+            source_files_config = []
+            
+            for i, file in enumerate(uploaded_files):
+                with st.container():
+                    st.markdown(f"### 📄 {file.name}")
+                    
+                    # シート名設定
+                    col_sheet, col_method = st.columns([2, 1])
+                    
+                    with col_method:
+                        # 入力方法選択
+                        method_key = f"method_{i}_{file.name}"
+                        sheet_input_method = st.radio(
+                            "入力方法",
+                            ["手動入力", "自動検出"],
+                            index=0,
+                            key=method_key,
+                            help="手動入力を推奨"
+                        )
+                    
+                    with col_sheet:
+                        if sheet_input_method == "手動入力":
+                            # 一般的なシート名の選択肢
+                            common_sheets = [
+                                "受注ベース収支計画",
+                                "Sheet1",
+                                "【事業計画】PL推移", 
+                                "PL - サマリー(年度)",
+                                "損益計算書",
+                                "PL",
+                                "収支計画",
+                                "事業計画"
+                            ]
+                            
+                            sheet_key = f"sheet_{i}_{file.name}"
+                            selected_sheet = st.selectbox(
+                                "シート名を選択",
+                                options=common_sheets,
+                                index=0,  # デフォルトは「受注ベース収支計画」
+                                key=sheet_key
+                            )
+                        else:
+                            # 自動検出
+                            try:
+                                file_content = file.read()
+                                file.seek(0)  # ファイルポインタをリセット
+                                
+                                sheet_names = get_excel_sheets(file_content)
+                                
+                                if sheet_names:
+                                    auto_sheet_key = f"auto_sheet_{i}_{file.name}"
+                                    selected_sheet = st.selectbox(
+                                        "検出されたシート",
+                                        options=sheet_names,
+                                        index=0,
+                                        key=auto_sheet_key
+                                    )
+                                else:
+                                    selected_sheet = "Sheet1"
+                                    st.warning("シート検出に失敗。Sheet1を使用します。")
+                            except Exception as e:
+                                selected_sheet = "Sheet1"
+                                st.error(f"ファイル読み込みエラー: {e}")
+                    
+                    # 詳細設定
+                    with st.expander(f"詳細設定 - {file.name}", expanded=False):
+                        data_range_key = f"range_{i}_{file.name}"
+                        data_range = st.text_input(
+                            "データ範囲（例: A1:Z100）",
+                            value="",
+                            key=data_range_key,
+                            help="空欄の場合は全データを対象とします"
+                        )
+                        
+                        # Claude API版の特徴表示
+                        if "claude" in lambda_function_name.lower():
+                            st.info("""
+                            🤖 **Claude API版の特徴**
+                            - AI（Claude-3-Haiku）がExcelデータを理解
+                            - 項目名のゆらぎに強く、柔軟な認識が可能
+                            - 数値の単位変換も自動で処理
+                            - 抽出精度が大幅に向上
+                            """)
+                    
+                    # 設定を保存
+                    source_files_config.append({
+                        "file_name": file.name,
+                        "file_object": file,
+                        "sheet_name": selected_sheet,
+                        "data_range": data_range
+                    })
+            
+            # 処理実行ボタン
+            button_text = "🤖 Claude AI集計実行" if "claude" in lambda_function_name.lower() else "🚀 AI集計実行"
+            
+            if not st.session_state.processing:
+                if st.button(button_text, type="primary", use_container_width=True, key="execute_button"):
+                    st.session_state.processing = True
+                    process_files(source_files_config, company_name, lambda_client, s3_client, lambda_function_name, selected_lambda)
+                    st.session_state.processing = False
             else:
-                st.error(f"❌ {source_file.name} のアップロードに失敗しました")
-                return
-        
-        # ステップ2: Lambda関数を実行
-        status_text.text("⚡ Lambda関数を実行中...")
-        progress_bar.progress(0.4)
-        
-        aws_config = get_aws_config()
-        
-        # Lambda実行用のペイロード
-        payload = {
-            "bucket": bucket_name,
-            "input_template_key": template_key,
-            "source_files": source_keys,
-            "output_prefix": f"outputs/{process_id}_"
-        }
-        
-        if show_progress:
-            with st.expander("🔍 実行詳細"):
-                st.json(payload)
-        
-        # Lambda関数実行
-        lambda_result = invoke_lambda_function(lambda_client, payload)
-        
-        if not lambda_result:
-            st.error("❌ Lambda関数の実行に失敗しました")
-            st.info("💡 ヒント: Lambda関数が正しくデプロイされているか確認してください")
-            return
-        
-        progress_bar.progress(0.6)
-        
-        # ステップ3: 結果の処理
-        status_text.text("📊 結果を処理中...")
-        
-        if lambda_result.get('statusCode') == 200:
-            # pandasをここでインポート（遅延インポート）
-            try:
-                import pandas as pd
-            except ImportError:
-                st.error("❌ pandasが利用できません。結果表示が制限されます。")
-                pd = None
-            
-            body = json.loads(lambda_result['body']) if isinstance(lambda_result.get('body'), str) else lambda_result.get('body', {})
-            results = body.get('results', [])
-            processed_files = body.get('processed_files', [])
-            
-            progress_bar.progress(0.8)
-            
-            # 結果表示
-            st.header("📋 処理結果")
-            
-            # Lambda実行結果の詳細表示
-            if show_progress:
-                with st.expander("🔍 Lambda実行結果詳細"):
-                    st.json(lambda_result)
-            
-            # 結果テーブル
-            if results:
-                if pd is not None:
-                    try:
-                        results_df = pd.DataFrame(results)
-                        st.dataframe(results_df, use_container_width=True)
-                    except Exception as e:
-                        st.warning(f"テーブル表示エラー: {e}")
-                        st.json(results)  # フォールバックとしてJSON表示
-                else:
-                    st.json(results)  # pandasがない場合はJSON表示
+                st.info("処理中です...")
                 
-                # 成功/失敗の統計
-                success_count = len([r for r in results if r.get('status') == 'success'])
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("✅ 成功", success_count)
-                with col2:
-                    st.metric("❌ 失敗", len(results) - success_count)
-                with col3:
-                    st.metric("📊 総抽出項目", sum(r.get('extracted_items', 0) for r in results if 'extracted_items' in r))
-            
-            # ステップ4: ファイルダウンロード
-            if processed_files:
-                status_text.text("📥 ダウンロード準備中...")
-                progress_bar.progress(0.9)
-                
-                st.header("📥 ダウンロード")
-                
-                download_files(s3_client, processed_files, zip_results, bucket_name)
-                
-                # ファイルクリーンアップ
-                if not keep_files:
-                    cleanup_files(s3_client, template_key, source_keys, bucket_name)
-            
-            progress_bar.progress(1.0)
-            status_text.text("✅ 処理完了")
-            
-            st.success(f"🎉 処理完了: {len(processed_files)} ファイルが正常に処理されました")
-            st.balloons()
         else:
-            st.error(f"❌ Lambda実行エラー: {lambda_result}")
+            st.info("📤 左のサイドバーからExcelファイルをアップロードしてください。")
+            
+            # 使用方法
+            with st.expander("📖 使用方法", expanded=True):
+                st.markdown("""
+                ### 使い方
+                1. **Lambda関数選択**: Claude API版（推奨）を選択
+                2. **ファイルアップロード**: サイドバーから集計したいExcelファイルを選択
+                3. **シート選択**: 「受注ベース収支計画」を選択（推奨）
+                4. **実行**: 「Claude AI集計実行」ボタンをクリック
+                
+                ### Claude API版の優位性
+                - **高精度**: AIがデータの意味を理解して抽出
+                - **柔軟性**: 項目名のゆらぎに対応
+                - **自動処理**: 単位変換や数値正規化を自動実行
+                - **日本語対応**: 日本語の財務用語を深く理解
+                
+                ### 対応している項目
+                - 売上高、売上原価、売上総利益
+                - 販売費及び一般管理費、営業利益
+                - 経常利益、当期純利益
+                - その他のPL項目
+                """)
+    
+    with col2:
+        st.subheader("ℹ️ システム情報")
         
-    except Exception as e:
-        st.error(f"❌ 処理中にエラーが発生しました: {e}")
-        with st.expander("🔍 エラー詳細"):
-            st.exception(e)
+        # 使用中のLambda関数情報
+        try:
+            if "claude" in lambda_function_name.lower():
+                status_color = "🤖"
+                extraction_method = "Claude-3-Haiku API"
+                features = ["AI理解ベース", "高精度抽出", "柔軟認識"]
+            else:
+                status_color = "⚡"  
+                extraction_method = "パターンマッチング"
+                features = ["高速処理", "安定動作", "軽量"]
+            
+            st.info(f"""
+            {status_color} **使用中: {selected_lambda}**
+            
+            **Lambda関数**: {lambda_function_name}
+            **抽出方式**: {extraction_method}
+            **S3バケット**: {BUCKET_NAME}
+            **リージョン**: {REGION}
+            **データ単位**: 百万円
+            
+            **特徴**: {" / ".join(features)}
+            """)
+            
+            # S3バケット内容表示
+            if st.button("📂 S3バケット確認", key="s3_check_button"):
+                show_s3_contents(s3_client)
+                
+            # テンプレートダウンロード
+            if st.button("📥 テンプレートダウンロード", key="template_download_button"):
+                download_template(s3_client)
+                
+        except Exception as e:
+            st.error(f"システム情報表示エラー: {e}")
 
-def download_files(s3_client, processed_files, zip_results, bucket_name):
-    """ファイルダウンロード処理"""
-    from pathlib import Path
+def process_files(source_files_config, company_name, lambda_client, s3_client, lambda_function_name, selected_lambda):
+    """ファイル処理を実行"""
     
-    if len(processed_files) == 1:
-        # 単一ファイルの場合
-        file_key = processed_files[0]
-        file_data = download_file_from_s3(s3_client, file_key, bucket_name)
+    with st.spinner("📤 ファイルをS3にアップロード中..."):
+        # S3にファイルをアップロード
+        source_files = []
         
-        if file_data:
-            file_name = Path(file_key).name
-            st.download_button(
-                label=f"📄 {file_name} をダウンロード",
-                data=file_data,
-                file_name=file_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    
-    elif zip_results:
-        # 複数ファイルをZIPで圧縮
-        zip_buffer = io.BytesIO()
-        
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            for file_key in processed_files:
-                file_data = download_file_from_s3(s3_client, file_key, bucket_name)
-                if file_data:
-                    file_name = Path(file_key).name
-                    zip_file.writestr(file_name, file_data)
-        
-        zip_buffer.seek(0)
-        
-        st.download_button(
-            label=f"📦 全結果ファイルをZIPでダウンロード ({len(processed_files)}件)",
-            data=zip_buffer.getvalue(),
-            file_name=f"excel_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-            mime="application/zip"
-        )
-    
-    else:
-        # 個別ダウンロード
-        for i, file_key in enumerate(processed_files):
-            file_data = download_file_from_s3(s3_client, file_key, bucket_name)
-            if file_data:
-                file_name = Path(file_key).name
-                st.download_button(
-                    label=f"📄 {file_name}",
-                    data=file_data,
-                    file_name=file_name,
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key=f"download_{i}"
+        for config in source_files_config:
+            file_obj = config["file_object"]
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            s3_key = f"source_files/{timestamp}_{file_obj.name}"
+            
+            try:
+                # ファイルをS3にアップロード
+                file_obj.seek(0)  # ファイルポインタをリセット
+                s3_client.put_object(
+                    Bucket=BUCKET_NAME,
+                    Key=s3_key,
+                    Body=file_obj.read(),
+                    ContentType='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
                 )
-
-def cleanup_files(s3_client, template_key, source_keys, bucket_name):
-    """一時ファイルのクリーンアップ"""
-    try:
-        # テンプレートファイルとソースファイルを削除
-        keys_to_delete = [template_key] + source_keys
-        
-        for key in keys_to_delete:
-            s3_client.delete_object(Bucket=bucket_name, Key=key)
-        
-        st.info(f"🧹 {len(keys_to_delete)} 個の一時ファイルをクリーンアップしました")
-    except Exception as e:
-        st.warning(f"⚠️ クリーンアップエラー: {e}")
-
-def show_aws_setup_guide():
-    """AWS設定ガイドの表示"""
-    st.error("### ❌ AWS設定が必要です")
+                
+                # Lambda用の設定
+                source_files.append({
+                    "file_key": s3_key,
+                    "sheet_name": config["sheet_name"],
+                    "data_range": config.get("data_range", "")
+                })
+                
+                st.success(f"✅ {file_obj.name} アップロード完了")
+                
+            except Exception as e:
+                st.error(f"❌ {file_obj.name} アップロード失敗: {e}")
+                return
     
-    with st.expander("🔧 AWS設定ガイド", expanded=True):
-        st.markdown("""
-        ### S3バケットアクセス権限の設定
+    # Lambda実行
+    processing_message = "🤖 Claude AIで処理中..." if "claude" in lambda_function_name.lower() else "🚀 AI集計処理中..."
+    
+    with st.spinner(processing_message):
+        try:
+            # Lambda関数呼び出し
+            lambda_event = {
+                "bucket": BUCKET_NAME,
+                "input_template_key": "templates/input用.xlsx",
+                "output_prefix": f"outputs/{datetime.now().strftime('%Y%m%d_%H%M%S')}/",
+                "source_files": source_files,
+                "company_name": company_name
+            }
+            
+            response = lambda_client.invoke(
+                FunctionName=lambda_function_name,
+                Payload=json.dumps(lambda_event)
+            )
+            
+            # レスポンス処理
+            response_payload = json.loads(response['Payload'].read().decode('utf-8'))
+            
+            if response_payload.get('statusCode') == 200:
+                body = json.loads(response_payload['body'])
+                
+                success_message = f"✅ {selected_lambda}での処理が完了しました！"
+                st.success(success_message)
+                
+                # 結果表示
+                st.subheader("📊 処理結果")
+                
+                results = body.get('results', [])
+                
+                # Claude版の場合の抽出データ表示
+                if "claude" in lambda_function_name.lower():
+                    st.subheader("🤖 Claude AIによる抽出データ")
+                    
+                    for result in results:
+                        if result.get('extracted_data'):
+                            st.markdown(f"#### 📄 {Path(result['source_file']).name}")
+                            
+                            extracted_data = result['extracted_data']
+                            if extracted_data:
+                                df_extracted = pd.DataFrame([
+                                    {"項目": k, "抽出値": f"{v:,.0f}" if isinstance(v, (int, float)) else str(v)}
+                                    for k, v in extracted_data.items()
+                                ])
+                                
+                                st.dataframe(df_extracted, use_container_width=True)
+                                st.success(f"✨ {len(extracted_data)}個の項目をClaude AIが自動認識・抽出しました")
+                            else:
+                                st.warning("データが抽出できませんでした")
+                        else:
+                            st.warning(f"📄 {Path(result['source_file']).name}: データ抽出に失敗")
+                
+                # 出力ファイルのダウンロードリンク表示
+                processed_files = body.get('processed_files', [])
+                if processed_files:
+                    st.subheader("📥 生成されたファイル")
+                    
+                    for file_key in processed_files:
+                        try:
+                            # 署名付きURLを生成
+                            download_url = s3_client.generate_presigned_url(
+                                'get_object',
+                                Params={'Bucket': BUCKET_NAME, 'Key': file_key},
+                                ExpiresIn=3600
+                            )
+                            file_name = Path(file_key).name
+                            
+                            # ダウンロードボタンまたはリンク
+                            col_download, col_info = st.columns([3, 1])
+                            
+                            with col_download:
+                                st.markdown(f"📄 **{file_name}**")
+                                st.markdown(f"[📥 ダウンロード]({download_url})")
+                            
+                            with col_info:
+                                # ファイル情報表示
+                                try:
+                                    obj_info = s3_client.head_object(Bucket=BUCKET_NAME, Key=file_key)
+                                    file_size = obj_info['ContentLength']
+                                    st.text(f"サイズ: {file_size:,} bytes")
+                                    st.text(f"更新: {obj_info['LastModified'].strftime('%H:%M:%S')}")
+                                except:
+                                    st.text("情報取得中...")
+                            
+                        except Exception as e:
+                            st.error(f"ダウンロードリンク生成エラー: {e}")
+                
+                # 更新されたセル情報の表示
+                st.subheader("🔄 テンプレート更新詳細")
+                
+                for result in results:
+                    if result.get('updated_cells'):
+                        st.markdown(f"#### 📄 {Path(result['source_file']).name}")
+                        
+                        # 更新されたセルの表示
+                        updated_cells = result['updated_cells']
+                        if updated_cells:
+                            update_df = pd.DataFrame(updated_cells)
+                            
+                            # 見やすい形式に変換
+                            display_df = pd.DataFrame([
+                                {
+                                    "セル": cell['cell'],
+                                    "項目": cell['item'], 
+                                    "旧値": cell['old_value'],
+                                    "新値": f"{cell['new_value']:,.0f}" if isinstance(cell['new_value'], (int, float)) else str(cell['new_value']),
+                                    "ソース": cell['source']
+                                }
+                                for cell in updated_cells
+                            ])
+                            
+                            st.dataframe(display_df, use_container_width=True)
+                            st.success(f"✅ {len(updated_cells)}個のセルを更新しました")
+                        
+                        # 使用期間情報
+                        if result.get('used_period'):
+                            st.info(f"🎯 使用期間: {result['used_period']}")
+                
+                # パフォーマンス情報
+                total_items = body.get('total_extracted_items', 0)
+                extraction_method = body.get('extraction_method', selected_lambda)
+                
+                st.info(f"""
+                📈 **処理サマリー**
+                - 使用システム: {extraction_method}
+                - 処理ファイル数: {len(source_files)}
+                - 抽出項目総数: {total_items}項目
+                - 生成ファイル数: {len(processed_files)}個
+                """)
+                
+                # 詳細情報
+                with st.expander("🔍 詳細情報"):
+                    st.json(body)
+                    
+            else:
+                st.error(f"❌ {selected_lambda}での処理でエラーが発生しました")
+                error_body = response_payload.get('body', '')
+                st.error(error_body)
+                
+                # Claude版の場合のトラブルシューティング
+                if "claude" in lambda_function_name.lower():
+                    st.warning("""
+                    🔧 **Claude API版でエラーが発生した場合:**
+                    1. Claude APIキーが正しく設定されているか確認
+                    2. AWS Secrets Managerの'claude-api-key'を確認
+                    3. Lambda関数のタイムアウト設定を確認
+                    4. ネットワーク接続とAPI制限を確認
+                    """)
+                
+        except Exception as e:
+            st.error(f"❌ Lambda実行エラー: {e}")
+            
+            # エラー詳細
+            with st.expander("エラー詳細とサポート情報"):
+                st.code(str(e))
+
+def show_s3_contents(s3_client):
+    """S3バケットの内容を表示"""
+    try:
+        response = s3_client.list_objects_v2(Bucket=BUCKET_NAME)
         
-        1. **AWS Console** → **IAM** → **Users** → あなたのユーザー
-        2. **Permissions** タブ → **Add permissions** → **Attach policies directly**
-        3. 以下のポリシーを追加:
-           - `AmazonS3FullAccess`
-           - `AWSLambdaInvokeFunction`
-        
-        ### または新しいS3バケットを作成
-        
-        ```bash
-        aws s3 mb s3://your-new-bucket-name --region ap-northeast-1
-        ```
-        
-        ### Streamlit Cloud Secrets設定
-        
-        ```toml
-        AWS_ACCESS_KEY_ID = "your_access_key"
-        AWS_SECRET_ACCESS_KEY = "your_secret_key"
-        AWS_DEFAULT_REGION = "ap-northeast-1"
-        S3_BUCKET_NAME = "your-new-bucket-name"
-        LAMBDA_FUNCTION_NAME = "excel-data-aggregator"
-        ```
-        """)
+        if 'Contents' in response:
+            objects = []
+            for obj in response['Contents']:
+                objects.append({
+                    'ファイル名': obj['Key'],
+                    'サイズ': f"{obj['Size']:,} bytes",
+                    '最終更新': obj['LastModified'].strftime('%Y-%m-%d %H:%M:%S')
+                })
+            
+            if objects:
+                df = pd.DataFrame(objects)
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("バケットは空です")
+        else:
+            st.info("バケットは空です")
+            
+    except Exception as e:
+        st.error(f"S3アクセスエラー: {e}")
+
+def download_template(s3_client):
+    """テンプレートファイルをダウンロード"""
+    try:
+        url = s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': BUCKET_NAME, 'Key': 'templates/input用.xlsx'},
+            ExpiresIn=3600
+        )
+        st.markdown(f"📄 [input用.xlsx テンプレートをダウンロード]({url})")
+    except Exception as e:
+        st.error(f"テンプレートダウンロードエラー: {e}")
 
 if __name__ == "__main__":
     main()
