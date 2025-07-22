@@ -437,7 +437,7 @@ def process_files(s3_client, lambda_client, bucket_name, input_template_file, so
             source_key = f"source-files/{process_id}_{i}_{source_file.name}"
             source_file.seek(0)
             if upload_file_to_s3(source_file, s3_client, source_key, bucket_name):
-                source_keys.append(source_key)
+                source_keys.append({"file_key": source_key})
                 # プログレスバーの値を0.0-1.0の範囲内に正規化
                 progress_value = 0.1 + (i + 1) * 0.25 / len(source_files)
                 progress_bar.progress(min(progress_value, 1.0))
