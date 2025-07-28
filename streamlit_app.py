@@ -233,7 +233,7 @@ def main():
                         if "claude" in lambda_function_name.lower():
                             st.info("""
                             🤖 **Claude API版の特徴**
-                            - AI（Claude-3-Haiku）がExcelデータを理解
+                            - AI（Claude-4-Sonnet）がExcelデータを理解
                             - 項目名のゆらぎに強く、柔軟な認識が可能
                             - 数値の単位変換も自動で処理
                             - 抽出精度が大幅に向上
@@ -290,7 +290,7 @@ def main():
         try:
             if "claude" in lambda_function_name.lower():
                 status_color = "🤖"
-                extraction_method = "Claude-3-Haiku API"
+                extraction_method = "Claude-4-Sonnet API"
                 features = ["AI理解ベース", "高精度抽出", "柔軟認識"]
             else:
                 status_color = "⚡"  
